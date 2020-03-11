@@ -44,6 +44,10 @@ impl CKBProtocolHandler for SyncMonitor {
             );
         }
     }
+
+    fn disconnected(&mut self, _nc: Arc<dyn CKBProtocolContext + Sync>, peer_index: PeerIndex) {
+        info!("disconnected peer index: {}", peer_index);
+    }
 }
 
 #[derive(Default)]
@@ -188,9 +192,10 @@ fn report(log_file: PathBuf) {
                         let mut v = o.get_mut();
                         v.0 += 1;
                         let peers = usize::from_str_radix(&captures["peers"], 10).unwrap();
-                        // 90% nodes, and >= 50 nodes samples, calculate the time duration
-                        if v.0 * 10 >= peers * 9 && v.0 >= 50 {
-                            let duration = time_duration(&captures["timestamp"], &v.1) as f64 / 1000.0;
+                        // 80% nodes, and >= 50 nodes samples, calculate the time duration
+                        if v.0 * 10 >= peers * 8 && v.0 >= 50 {
+                            let duration =
+                                time_duration(&captures["timestamp"], &v.1) as f64 / 1000.0;
                             result.push(duration);
                             o.remove();
                             if result.len() >= 100 {
@@ -202,7 +207,7 @@ fn report(log_file: PathBuf) {
                                             .with_offset(5)
                                             .with_height(30)
                                             .with_caption(
-                                                "Block 90% nodes propagation time ".to_string()
+                                                "Block 80% nodes propagation time ".to_string()
                                             )
                                     )
                                 );
