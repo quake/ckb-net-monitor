@@ -1,0 +1,22 @@
+[package]
+name = "ckb-net-monitor"
+version = "0.1.0"
+authors = ["quake <quake.wang@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ctrlc = { version = "3.1", features = ["termination"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.5"
+regex = "1"
+chrono = "0.4"
+rasciigraph = "0.1.1"
+
+ckb-network = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.30.0-rc1" }
+ckb-util = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.30.0-rc1" }
+ckb-sync = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.30.0-rc1" }
+ckb-logger = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.30.0-rc1" }
+ckb-build-info = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.30.0-rc1" }
+ckb-types = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.30.0-rc1" }
