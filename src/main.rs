@@ -1,6 +1,6 @@
 use chrono::DateTime;
 use ckb_build_info::Version;
-use ckb_logger::info;
+use ckb_logger::{info, metric};
 use ckb_network::{
     bytes::Bytes, CKBProtocol, CKBProtocolContext, CKBProtocolHandler, NetworkService,
     NetworkState, PeerIndex, MAX_FRAME_LENGTH_RELAY, MAX_FRAME_LENGTH_SYNC,
@@ -84,6 +84,11 @@ impl CKBProtocolHandler for RelayMonitor {
                     compact_block.header().into_view().hash(),
                     self.peers_counter
                 );
+                metric!({
+                    "topic": "propagation",
+                    "tags": { "compact_block": format!("{}", compact_block.header().into_view().hash()) },
+                    "fields": { "total_peers": self.peers_counter },
+                });
             }
             packed::RelayMessageUnion::RelayTransactionHashes(relay_transaction_hashes) => {
                 relay_transaction_hashes
