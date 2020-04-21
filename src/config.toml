@@ -1,5 +1,5 @@
 [logger]
-filter = "info"
+filter = "info,ckb-metrics=trace"
 color = false
 log_to_file = true
 log_to_stdout = true
