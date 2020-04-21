@@ -5,7 +5,7 @@ log_to_file = true
 log_to_stdout = true
 
 [network]
-listen_addresses = ["/ip4/0.0.0.0/tcp/8115"]
+listen_addresses = ["/ip4/0.0.0.0/tcp/8120"]
 ### Specify the public and routable network addresses
 # public_addresses = []
 
