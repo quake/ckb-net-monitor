@@ -1,13 +1,15 @@
 use chrono::DateTime;
 use ckb_build_info::Version;
-use ckb_logger::{info, metric};
+use ckb_logger::{error, info, metric};
 use ckb_network::{
-    bytes::Bytes, CKBProtocol, CKBProtocolContext, CKBProtocolHandler, NetworkService,
-    NetworkState, PeerIndex, MAX_FRAME_LENGTH_RELAY, MAX_FRAME_LENGTH_SYNC,
+    bytes::Bytes, BlockingFlag, CKBProtocol, CKBProtocolContext, CKBProtocolHandler,
+    NetworkService, NetworkState, PeerIndex, MAX_FRAME_LENGTH_RELAY, MAX_FRAME_LENGTH_SYNC,
 };
 use ckb_sync::NetworkProtocol;
+use ckb_types::packed::Byte32;
 use ckb_types::{packed, prelude::*};
-use ckb_util::{Condvar, Mutex};
+use ckb_util::{Condvar, Mutex, RwLock};
+use faketime::unix_time_as_millis;
 use rasciigraph::{plot, Config as GraphConfig};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -16,9 +18,11 @@ use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+pub const PRINT_LATENCY_INTERVAL: Duration = Duration::from_secs(10);
+pub const PRINT_LATENCY_TOKEN: u64 = 11111;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Config {
@@ -26,10 +30,47 @@ struct Config {
     pub network: ckb_network::NetworkConfig,
 }
 
-struct SyncMonitor;
+struct PeerState {
+    in_flight_blocks: HashMap<Byte32, u64>, // block_hash => timestamp
+    latency: u64,                           // ms
+}
 
-impl CKBProtocolHandler for SyncMonitor {
-    fn init(&mut self, _nc: Arc<dyn CKBProtocolContext + Sync>) {}
+struct MonitorHandler {
+    peers: Arc<RwLock<HashMap<PeerIndex, PeerState>>>,
+}
+
+impl Default for PeerState {
+    fn default() -> Self {
+        Self {
+            in_flight_blocks: Default::default(),
+            latency: u64::max_value(),
+        }
+    }
+}
+
+impl Default for MonitorHandler {
+    fn default() -> Self {
+        Self {
+            peers: Arc::new(RwLock::new(Default::default())),
+        }
+    }
+}
+
+impl Clone for MonitorHandler {
+    fn clone(&self) -> Self {
+        Self {
+            peers: Arc::clone(&self.peers),
+        }
+    }
+}
+
+impl CKBProtocolHandler for MonitorHandler {
+    fn init(&mut self, nc: Arc<dyn CKBProtocolContext + Sync>) {
+        if nc.protocol_id() == NetworkProtocol::SYNC.into() {
+            nc.set_notify(PRINT_LATENCY_INTERVAL, PRINT_LATENCY_TOKEN)
+                .expect("set_notify PRINT_LATENCY_TOKEN");
+        }
+    }
 
     fn connected(
         &mut self,
@@ -37,7 +78,14 @@ impl CKBProtocolHandler for SyncMonitor {
         peer_index: PeerIndex,
         _version: &str,
     ) {
+        let mut peers = self.peers.write();
+        if peers.contains_key(&peer_index) {
+            return;
+        }
+
         if let Some(peer) = nc.get_peer(peer_index) {
+            peers.insert(peer_index, Default::default());
+
             info!(
                 "connected peer index: {}, connected_addr: {}, listened_addrs: {:?}, client_version: {}",
                 peer_index, peer.connected_addr, peer.listened_addrs, peer.identify_info.map(|info| info.client_version).unwrap_or_default()
@@ -46,17 +94,9 @@ impl CKBProtocolHandler for SyncMonitor {
     }
 
     fn disconnected(&mut self, _nc: Arc<dyn CKBProtocolContext + Sync>, peer_index: PeerIndex) {
+        self.peers.write().remove(&peer_index);
         info!("disconnected peer index: {}", peer_index);
     }
-}
-
-#[derive(Default)]
-struct RelayMonitor {
-    peers_counter: AtomicUsize,
-}
-
-impl CKBProtocolHandler for RelayMonitor {
-    fn init(&mut self, _nc: Arc<dyn CKBProtocolContext + Sync>) {}
 
     fn received(
         &mut self,
@@ -64,31 +104,79 @@ impl CKBProtocolHandler for RelayMonitor {
         peer_index: PeerIndex,
         data: Bytes,
     ) {
-        let msg = match packed::RelayMessage::from_slice(&data) {
-            Ok(msg) => msg.to_enum(),
-            _ => {
-                info!("peer {} sends us a malformed message", peer_index);
-                nc.ban_peer(
-                    peer_index,
-                    Duration::from_secs(5 * 60),
-                    String::from("send us a malformed message"),
-                );
-                return;
-            }
-        };
+        if let Ok(msg) = packed::SyncMessage::from_slice(&data) {
+            self.received_sync_message(nc, peer_index, msg.to_enum());
+        } else if let Ok(msg) = packed::RelayMessage::from_slice(&data) {
+            self.received_relay_message(nc, peer_index, msg.to_enum());
+        } else {
+            error!("peer {} sends us a malformed message", peer_index);
+            nc.ban_peer(
+                peer_index,
+                Duration::from_secs(5 * 60),
+                String::from("send us a malformed message"),
+            );
+        }
+    }
 
-        match msg {
+    fn notify(&mut self, _nc: Arc<dyn CKBProtocolContext + Sync>, token: u64) {
+        assert_eq!(token, PRINT_LATENCY_TOKEN);
+        let mut latencies: Vec<_> = self
+            .peers
+            .read()
+            .iter()
+            .map(|(_peer, state)| state.latency)
+            .collect();
+        latencies.sort();
+        info!("latencies: {:?}", latencies);
+    }
+}
+
+impl MonitorHandler {
+    #[allow(clippy::single_match)]
+    fn received_sync_message(
+        &mut self,
+        _nc: Arc<dyn CKBProtocolContext + Sync>,
+        peer_index: PeerIndex,
+        message: packed::SyncMessageUnion,
+    ) {
+        let mut peers = self.peers.write();
+        let state = peers.get_mut(&peer_index).expect("connected peer exist");
+
+        match message {
+            packed::SyncMessageUnion::SendBlock(block) => {
+                let block_hash = block.block().header().into_view().hash();
+                if let Some(timestamp) = state.in_flight_blocks.remove(&block_hash) {
+                    let latency = unix_time_as_millis() - timestamp;
+                    state.latency = latency;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn received_relay_message(
+        &mut self,
+        nc: Arc<dyn CKBProtocolContext + Sync>,
+        peer_index: PeerIndex,
+        message: packed::RelayMessageUnion,
+    ) {
+        let total_peers = self.peers.read().len();
+        match message {
             packed::RelayMessageUnion::CompactBlock(compact_block) => {
                 info!(
                     "compact_block: {:#x}, peers: {:?}",
                     compact_block.header().into_view().hash(),
-                    self.peers_counter
+                    total_peers,
                 );
+                let block_hash = compact_block.header().into_view().hash();
                 metric!({
                     "topic": "propagation",
-                    "tags": { "compact_block": format!("{}", compact_block.header().into_view().hash()) },
-                    "fields": { "total_peers": self.peers_counter },
+                    "tags": { "compact_block": format!("{}", block_hash) },
+                    "fields": { "total_peers": total_peers },
                 });
+
+                // We want to collect the latency between peers.
+                self.send_getblock(&nc, peer_index, block_hash);
             }
             packed::RelayMessageUnion::RelayTransactionHashes(relay_transaction_hashes) => {
                 relay_transaction_hashes
@@ -97,7 +185,7 @@ impl CKBProtocolHandler for RelayMonitor {
                     .for_each(|tx_hash| {
                         info!(
                             "relay_transaction_hashes: {:#x}, peers: {:?}",
-                            tx_hash, self.peers_counter
+                            tx_hash, total_peers,
                         );
                     })
             }
@@ -105,17 +193,26 @@ impl CKBProtocolHandler for RelayMonitor {
         }
     }
 
-    fn connected(
-        &mut self,
-        _nc: Arc<dyn CKBProtocolContext + Sync>,
-        _peer_index: PeerIndex,
-        _version: &str,
+    fn send_getblock(
+        &self,
+        nc: &Arc<dyn CKBProtocolContext + Sync>,
+        peer: PeerIndex,
+        block_hash: Byte32,
     ) {
-        self.peers_counter.fetch_add(1, Ordering::SeqCst);
-    }
+        let hashes = vec![block_hash.clone()];
+        let content = packed::GetBlocks::new_builder()
+            .block_hashes(hashes.pack())
+            .build();
+        let message = packed::SyncMessage::new_builder().set(content).build();
+        if let Err(err) = nc.send_message(NetworkProtocol::SYNC.into(), peer, message.as_bytes()) {
+            error!("send_getblock to {} error: {:?}", peer, err);
+        }
 
-    fn disconnected(&mut self, _nc: Arc<dyn CKBProtocolContext + Sync>, _peer_index: PeerIndex) {
-        self.peers_counter.fetch_sub(1, Ordering::SeqCst);
+        let mut peers = self.peers.write();
+        let state = peers.get_mut(&peer).expect("connected peer exist");
+        state
+            .in_flight_blocks
+            .insert(block_hash, unix_time_as_millis());
     }
 }
 
@@ -149,22 +246,27 @@ fn init_network(config: ckb_network::NetworkConfig) {
     let required_protocol_ids = vec![NetworkProtocol::SYNC.into()];
     let version = get_version();
 
+    let monitor = MonitorHandler::default();
+    let monitor_clone = monitor.clone();
+
     let protocols = vec![
         CKBProtocol::new(
             "syn".to_string(),
             NetworkProtocol::SYNC.into(),
             &["1".to_string()][..],
             MAX_FRAME_LENGTH_SYNC,
-            move || Box::new(SyncMonitor),
+            move || Box::new(monitor.clone()),
             Arc::clone(&network_state),
+            BlockingFlag::default(),
         ),
         CKBProtocol::new(
             "rel".to_string(),
             NetworkProtocol::RELAY.into(),
             &["1".to_string()][..],
             MAX_FRAME_LENGTH_RELAY,
-            move || Box::new(RelayMonitor::default()),
+            move || Box::new(monitor_clone.clone()),
             Arc::clone(&network_state),
+            BlockingFlag::default(),
         ),
     ];
 
