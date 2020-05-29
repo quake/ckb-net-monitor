@@ -13,10 +13,11 @@ toml = "0.5"
 regex = "1"
 chrono = "0.4"
 rasciigraph = "0.1.1"
+faketime = "0.2.0"
 
-ckb-network = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.30.0-rc1" }
-ckb-util = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.30.0-rc1" }
-ckb-sync = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.30.0-rc1" }
-ckb-logger = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.30.0-rc1" }
-ckb-build-info = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.30.0-rc1" }
-ckb-types = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.30.0-rc1" }
+ckb-network = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.32.0" }
+ckb-util = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.32.0" }
+ckb-sync = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.32.0" }
+ckb-logger = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.32.0" }
+ckb-build-info = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.32.0" }
+ckb-types = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.32.0" }
