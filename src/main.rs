@@ -7,7 +7,7 @@ use ckb_network::{
 };
 use ckb_sync::NetworkProtocol;
 use ckb_types::packed::Byte32;
-use ckb_types::{packed, prelude::*};
+use ckb_types::{core, packed, prelude::*};
 use ckb_util::{Condvar, Mutex, RwLock};
 use faketime::unix_time_as_millis;
 use rasciigraph::{plot, Config as GraphConfig};
@@ -21,8 +21,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub const PRINT_LATENCY_INTERVAL: Duration = Duration::from_secs(10);
+pub const PRINT_LATENCY_INTERVAL: Duration = Duration::from_secs(20);
 pub const PRINT_LATENCY_TOKEN: u64 = 11111;
+pub const PRINT_LATENCY_COUNT: u64 = 10;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Config {
@@ -31,8 +32,9 @@ struct Config {
 }
 
 struct PeerState {
-    in_flight_blocks: HashMap<Byte32, u64>, // block_hash => timestamp
-    latency: u64,                           // ms
+    headers: HashMap<Byte32, core::HeaderView>,
+    in_flight_blocks: HashMap<Byte32, u64>, // block_hash => the timestamp sent request
+    arrived_blocks: HashMap<Byte32, u64>,   // block_hash => the latency received response
 }
 
 struct MonitorHandler {
@@ -42,8 +44,9 @@ struct MonitorHandler {
 impl Default for PeerState {
     fn default() -> Self {
         Self {
+            headers: Default::default(),
             in_flight_blocks: Default::default(),
-            latency: u64::max_value(),
+            arrived_blocks: Default::default(),
         }
     }
 }
@@ -118,16 +121,60 @@ impl CKBProtocolHandler for MonitorHandler {
         }
     }
 
-    fn notify(&mut self, _nc: Arc<dyn CKBProtocolContext + Sync>, token: u64) {
+    fn notify(&mut self, nc: Arc<dyn CKBProtocolContext + Sync>, token: u64) {
         assert_eq!(token, PRINT_LATENCY_TOKEN);
-        let mut latencies: Vec<_> = self
-            .peers
-            .read()
-            .iter()
-            .map(|(_peer, state)| state.latency)
-            .collect();
-        latencies.sort();
-        info!("latencies: {:?}", latencies);
+
+        let mut peers = self.peers.write();
+        for (peer_index, state) in peers.iter_mut() {
+            let mut latencies = HashMap::<u64, u64>::new();
+            let headers = &state.headers;
+            for (block_hash, _) in state.in_flight_blocks.iter() {
+                let header = headers.get(block_hash).unwrap();
+                latencies.insert(header.number(), u64::max_value());
+            }
+            for (block_hash, latency) in state.arrived_blocks.iter() {
+                let header = headers.get(block_hash).unwrap();
+                latencies.insert(header.number(), *latency);
+            }
+
+            let mut latencies = latencies.into_iter().collect::<Vec<_>>();
+            latencies.sort_by_key(|(number, _latency)| *number);
+            info!(
+                "Peer({}): {:?}",
+                peer_index,
+                latencies
+                    .into_iter()
+                    .map(|(_number, latency)| latency)
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        for (peer_index, state) in peers.iter_mut() {
+            state.arrived_blocks.clear();
+            state.in_flight_blocks.clear();
+            if state.headers.len() > PRINT_LATENCY_COUNT as usize {
+                let tip_number = state
+                    .headers
+                    .iter()
+                    .map(|(_, header)| header.number())
+                    .max()
+                    .unwrap_or(0);
+                state.headers.retain(|_, header| {
+                    header.number() > tip_number.saturating_sub(PRINT_LATENCY_COUNT)
+                });
+            }
+
+            let hashes = state
+                .headers
+                .iter()
+                .map(|(_, header)| header.hash())
+                .collect::<Vec<_>>();
+            self.send_getblocks(&nc, *peer_index, hashes);
+            let now = unix_time_as_millis();
+            for (block_hash, _) in state.headers.iter() {
+                state.in_flight_blocks.insert(block_hash.clone(), now);
+            }
+        }
     }
 }
 
@@ -147,7 +194,7 @@ impl MonitorHandler {
                 let block_hash = block.block().header().into_view().hash();
                 if let Some(timestamp) = state.in_flight_blocks.remove(&block_hash) {
                     let latency = unix_time_as_millis() - timestamp;
-                    state.latency = latency;
+                    state.arrived_blocks.insert(block_hash, latency);
                 }
             }
             _ => {}
@@ -156,7 +203,7 @@ impl MonitorHandler {
 
     fn received_relay_message(
         &mut self,
-        nc: Arc<dyn CKBProtocolContext + Sync>,
+        _nc: Arc<dyn CKBProtocolContext + Sync>,
         peer_index: PeerIndex,
         message: packed::RelayMessageUnion,
     ) {
@@ -168,7 +215,8 @@ impl MonitorHandler {
                     compact_block.header().into_view().hash(),
                     total_peers,
                 );
-                let block_hash = compact_block.header().into_view().hash();
+                let header = compact_block.header().into_view();
+                let block_hash = header.hash();
                 metric!({
                     "topic": "propagation",
                     "tags": { "compact_block": format!("{}", block_hash) },
@@ -176,7 +224,9 @@ impl MonitorHandler {
                 });
 
                 // We want to collect the latency between peers.
-                self.send_getblock(&nc, peer_index, block_hash);
+                let mut peers = self.peers.write();
+                let state = peers.get_mut(&peer_index).expect("connected peer exist");
+                state.headers.insert(block_hash, header);
             }
             packed::RelayMessageUnion::RelayTransactionHashes(relay_transaction_hashes) => {
                 relay_transaction_hashes
@@ -193,13 +243,12 @@ impl MonitorHandler {
         }
     }
 
-    fn send_getblock(
+    fn send_getblocks(
         &self,
         nc: &Arc<dyn CKBProtocolContext + Sync>,
         peer: PeerIndex,
-        block_hash: Byte32,
+        hashes: Vec<Byte32>,
     ) {
-        let hashes = vec![block_hash.clone()];
         let content = packed::GetBlocks::new_builder()
             .block_hashes(hashes.pack())
             .build();
@@ -207,12 +256,6 @@ impl MonitorHandler {
         if let Err(err) = nc.send_message(NetworkProtocol::SYNC.into(), peer, message.as_bytes()) {
             error!("send_getblock to {} error: {:?}", peer, err);
         }
-
-        let mut peers = self.peers.write();
-        let state = peers.get_mut(&peer).expect("connected peer exist");
-        state
-            .in_flight_blocks
-            .insert(block_hash, unix_time_as_millis());
     }
 }
 
