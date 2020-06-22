@@ -9,7 +9,6 @@ use ckb_sync::NetworkProtocol;
 use ckb_types::packed::Byte32;
 use ckb_types::{core, packed, prelude::*};
 use ckb_util::{Condvar, Mutex, RwLock};
-use faketime::unix_time_as_millis;
 use rasciigraph::{plot, Config as GraphConfig};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -19,7 +18,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const PRINT_LATENCY_INTERVAL: Duration = Duration::from_secs(20);
 pub const PRINT_LATENCY_TOKEN: u64 = 11111;
@@ -33,8 +32,8 @@ struct Config {
 
 struct PeerState {
     headers: HashMap<Byte32, core::HeaderView>,
-    in_flight_blocks: HashMap<Byte32, u64>, // block_hash => the timestamp sent request
-    arrived_blocks: HashMap<Byte32, u64>,   // block_hash => the latency received response
+    in_flight_blocks: HashMap<Byte32, Instant>, // block_hash => the timestamp sent request
+    arrived_blocks: HashMap<Byte32, Duration>,  // block_hash => the latency received response
 }
 
 struct MonitorHandler {
@@ -125,6 +124,7 @@ impl CKBProtocolHandler for MonitorHandler {
         assert_eq!(token, PRINT_LATENCY_TOKEN);
 
         let mut peers = self.peers.write();
+        let mut outputs = HashMap::new();
         for (peer_index, state) in peers.iter_mut() {
             let mut latencies = HashMap::<u64, u64>::new();
             let headers = &state.headers;
@@ -134,20 +134,14 @@ impl CKBProtocolHandler for MonitorHandler {
             }
             for (block_hash, latency) in state.arrived_blocks.iter() {
                 let header = headers.get(block_hash).unwrap();
-                latencies.insert(header.number(), *latency);
+                latencies.insert(header.number(), latency.as_millis() as u64);
             }
 
             let mut latencies = latencies.into_iter().collect::<Vec<_>>();
             latencies.sort_by_key(|(number, _latency)| *number);
-            info!(
-                "Peer({}): {:?}",
-                peer_index,
-                latencies
-                    .into_iter()
-                    .map(|(_number, latency)| latency)
-                    .collect::<Vec<_>>(),
-            );
+            outputs.insert(peer_index.value(), latencies);
         }
+        info!("latency: {:?}", outputs);
 
         for (peer_index, state) in peers.iter_mut() {
             state.arrived_blocks.clear();
@@ -170,7 +164,7 @@ impl CKBProtocolHandler for MonitorHandler {
                 .map(|(_, header)| header.hash())
                 .collect::<Vec<_>>();
             self.send_getblocks(&nc, *peer_index, hashes);
-            let now = unix_time_as_millis();
+            let now = Instant::now();
             for (block_hash, _) in state.headers.iter() {
                 state.in_flight_blocks.insert(block_hash.clone(), now);
             }
@@ -193,7 +187,7 @@ impl MonitorHandler {
             packed::SyncMessageUnion::SendBlock(block) => {
                 let block_hash = block.block().header().into_view().hash();
                 if let Some(timestamp) = state.in_flight_blocks.remove(&block_hash) {
-                    let latency = unix_time_as_millis() - timestamp;
+                    let latency = timestamp.elapsed();
                     state.arrived_blocks.insert(block_hash, latency);
                 }
             }

@@ -13,7 +13,6 @@ toml = "0.5"
 regex = "1"
 chrono = "0.4"
 rasciigraph = "0.1.1"
-faketime = "0.2.0"
 
 ckb-network = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.32.0" }
 ckb-util = { git = "https://github.com/nervosnetwork/ckb", rev = "v0.32.0" }
